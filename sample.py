@@ -1,89 +1,100 @@
 """
-Sample from a trained model
+Sample from a trained NanoDiffusionGPT checkpoint.
+
+Unlike GPT sampling, this does not append one token at a time. It creates a
+fixed number of [MASK] tokens after the prompt and denoises them in parallel.
 """
+
 import os
 import pickle
 from contextlib import nullcontext
+
 import torch
-import tiktoken
-from model import GPTConfig, GPT
+
+from model import NanoDiffusionGPT, NanoDiffusionGPTConfig
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+out_dir = "out-diffusion"
+start = "\n"
+num_samples = 5
+max_new_tokens = 300
+steps = 128
+temperature = 0.8
+top_k = 20
 seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+device = "cuda"
+dtype = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
+compile = False
+if os.path.exists("configurator.py"):
+    exec(open("configurator.py").read())
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device_type = "cuda" if "cuda" in device else "cpu"
+ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
+ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-
+ckpt_path = os.path.join(out_dir, "ckpt.pt")
+checkpoint = torch.load(ckpt_path, map_location=device)
+model = NanoDiffusionGPT(NanoDiffusionGPTConfig(**checkpoint["model_args"]))
+state_dict = checkpoint["model"]
+unwanted_prefix = "_orig_mod."
+for k, v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+model.load_state_dict(state_dict)
 model.eval()
 model.to(device)
 if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+    model = torch.compile(model)
+raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+dataset = checkpoint["config"]["dataset"]
+meta_path = os.path.join("data", dataset, "meta.pkl")
+if not os.path.exists(meta_path):
+    meta_path = os.path.join(out_dir, "meta.pkl")
+if not os.path.exists(meta_path):
+    meta_path = "meta.pkl"
+print(f"Loading meta from {meta_path}...")
+with open(meta_path, "rb") as f:
+    meta = pickle.load(f)
+stoi, itos = meta["stoi"], meta["itos"]
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
+
+def encode(s):
+    return [stoi[c] for c in s if c in stoi]
+
+
+def decode(ids):
+    return "".join(itos[i] for i in ids if i in itos)
+
+
+if start.startswith("FILE:"):
+    with open(start[5:], "r", encoding="utf-8") as f:
         start = f.read()
 start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+if not start_ids:
+    raise ValueError("prompt has no characters that exist in the dataset vocabulary")
+if len(start_ids) + max_new_tokens > raw_model.config.block_size:
+    raise ValueError(
+        f"prompt length ({len(start_ids)}) + max_new_tokens ({max_new_tokens}) "
+        f"exceeds block_size ({raw_model.config.block_size})"
+    )
+x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 
-# run generation
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = model.generate(
+                x,
+                max_new_tokens=max_new_tokens,
+                steps=steps,
+                temperature=temperature,
+                top_k=top_k,
+            )
             print(decode(y[0].tolist()))
-            print('---------------')
+            print("---------------")

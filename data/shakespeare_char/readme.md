@@ -1,7 +1,7 @@
 
-# tiny shakespeare, character-level
+# Tiny Shakespeare Character Dataset
 
-Tiny shakespeare, of the good old char-rnn fame :) Treated on character-level.
+Tiny Shakespeare prepared as a character-level token stream for NanoDiffusionGPT.
 
 After running `prepare.py`:
 
